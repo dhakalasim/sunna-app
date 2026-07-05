@@ -2,7 +2,11 @@ import * as Tone from "tone";
 import type { GenrePreset } from "./genrePresets";
 
 const MIN_DURATION = 5;
-const MAX_DURATION = 600; // 10 minutes cap, keeps render times reasonable
+const MAX_DURATION = 600; // 10 minutes cap, keeps memory use reasonable
+
+const LOOP_CYCLE = [true, false, false, false]; // accent (crash/fill) every 4th phrase repeat
+const FADE_IN_SECONDS = 0.02;
+const FADE_OUT_SECONDS = 1.0;
 
 function clampDuration(seconds: number): number {
   return Math.min(MAX_DURATION, Math.max(MIN_DURATION, seconds));
@@ -12,13 +16,17 @@ function transpose(note: string, semitones: number): string {
   return Tone.Frequency(note).transpose(semitones).toNote();
 }
 
-/** Renders a full genre-appropriate beat offline and returns a raw AudioBuffer. */
-export async function renderBeat(
-  genre: GenrePreset,
-  durationSecondsRaw: number,
-): Promise<AudioBuffer> {
-  const durationSeconds = clampDuration(durationSecondsRaw);
-  const fadeStart = Math.max(0, durationSeconds - 1.1);
+/**
+ * Synthesizes exactly one harmonic cycle (one pass through the genre's chord
+ * progression) offline. This is the only step that actually schedules Tone.js
+ * events, so its cost is bounded by the pattern length, not the requested
+ * beat duration — a 5-minute beat renders exactly as fast as a 10-second one.
+ */
+async function renderUnit(genre: GenrePreset, accent: boolean): Promise<AudioBuffer> {
+  const bars = genre.chordProgression.length;
+  const barSeconds = (60 / genre.bpm) * 4;
+  const unitSeconds = barSeconds * bars;
+  const stepsTotal = bars * 16;
 
   const toneBuffer = await Tone.Offline(async () => {
     const transport = Tone.getTransport();
@@ -26,7 +34,7 @@ export async function renderBeat(
     transport.swing = genre.swing;
     transport.swingSubdivision = "16n";
 
-    // ---- master bus: gain (for fade) -> compressor -> eq -> limiter -> out ----
+    // ---- master bus: gain (anti-click) -> compressor -> eq -> limiter -> out ----
     const masterGain = new Tone.Gain(0).toDestination();
     masterGain.gain.rampTo(1, 0.03);
 
@@ -39,16 +47,11 @@ export async function renderBeat(
       release: 0.15,
     }).connect(eq);
 
-    const masterBus = new Tone.Gain(1).connect(compressor);
-    masterBus.gain.setValueAtTime(1, 0);
-    masterBus.gain.setValueAtTime(1, Math.max(0, fadeStart - 0.01));
-    masterBus.gain.linearRampToValueAtTime(0.0001, durationSeconds - 0.05);
-
     const lowpass = new Tone.Filter({
       type: "lowpass",
       frequency: genre.mix.filterCutoff,
       rolloff: -12,
-    }).connect(masterBus);
+    }).connect(compressor);
 
     const reverb = new Tone.Reverb({
       decay: genre.mix.reverbDecay,
@@ -147,9 +150,8 @@ export async function renderBeat(
 
     // vinyl-noise texture for lo-fi
     let vinyl: Tone.Noise | undefined;
-    let vinylGain: Tone.Gain | undefined;
     if (genre.mix.vinylNoise) {
-      vinylGain = new Tone.Gain(0.035).connect(dryBus);
+      const vinylGain = new Tone.Gain(0.035).connect(dryBus);
       vinyl = new Tone.Noise("pink").connect(vinylGain);
     }
 
@@ -170,14 +172,13 @@ export async function renderBeat(
       none: [],
     };
 
-    let stepCounter = 0;
     let walkIndex = 0;
-
-    transport.scheduleRepeat((time) => {
+    let stepCounter = 0;
+    const repeatId = transport.scheduleRepeat((time) => {
       const stepInBar = stepCounter % 16;
       const barIndex = Math.floor(stepCounter / 16);
       const chord = genre.chordProgression[barIndex % genre.chordProgression.length];
-      const isPhraseStart = barIndex % 4 === 0 && stepInBar === 0;
+      const isPhraseStart = accent && barIndex === 0 && stepInBar === 0;
       const jitter = stepInBar % 2 === 1 ? (Math.random() - 0.5) * 0.004 : 0;
       const t = time + jitter;
 
@@ -193,10 +194,8 @@ export async function renderBeat(
       if (d.crashOnPhrase && isPhraseStart) crash.triggerAttackRelease("1n", t, 0.55);
 
       if (bassSteps[genre.bassStyle].includes(stepInBar)) {
-        let note = chord[0];
-        if (genre.bassStyle === "808slide") note = transpose(chord[0], -12);
-        else if (genre.bassStyle === "fourOnFloor") note = transpose(chord[0], -12);
-        else if (genre.bassStyle === "walking") {
+        let note: string;
+        if (genre.bassStyle === "walking") {
           const tone = chord[walkIndex % chord.length];
           note = transpose(tone, -12);
           walkIndex++;
@@ -228,15 +227,75 @@ export async function renderBeat(
       }
 
       stepCounter++;
+      if (stepCounter >= stepsTotal) transport.clear(repeatId);
     }, "16n", 0);
 
     vinyl?.start(0);
     transport.start(0);
-  }, durationSeconds);
+  }, unitSeconds);
 
   const audioBuffer = toneBuffer.get();
   if (!audioBuffer) throw new Error("Beat rendering failed to produce audio.");
   return audioBuffer;
+}
+
+/** Tiles two alternating unit buffers back-to-back to fill the target duration. */
+function tileToLength(units: AudioBuffer[], totalSeconds: number): AudioBuffer {
+  const sampleRate = units[0].sampleRate;
+  const numChannels = units[0].numberOfChannels;
+  const totalFrames = Math.round(totalSeconds * sampleRate);
+
+  const out = new AudioBuffer({ length: totalFrames, numberOfChannels: numChannels, sampleRate });
+
+  for (let ch = 0; ch < numChannels; ch++) {
+    const dest = out.getChannelData(ch);
+    let offset = 0;
+    let cycle = 0;
+    while (offset < totalFrames) {
+      const src = units[cycle % units.length].getChannelData(ch);
+      const copyLen = Math.min(src.length, totalFrames - offset);
+      dest.set(src.subarray(0, copyLen), offset);
+      offset += src.length;
+      cycle++;
+    }
+  }
+
+  return out;
+}
+
+function applyFades(buffer: AudioBuffer): void {
+  const sampleRate = buffer.sampleRate;
+  const fadeInSamples = Math.min(buffer.length, Math.round(FADE_IN_SECONDS * sampleRate));
+  const fadeOutSamples = Math.min(buffer.length, Math.round(FADE_OUT_SECONDS * sampleRate));
+
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const data = buffer.getChannelData(ch);
+    for (let i = 0; i < fadeInSamples; i++) {
+      data[i] *= i / fadeInSamples;
+    }
+    for (let i = 0; i < fadeOutSamples; i++) {
+      const idx = buffer.length - 1 - i;
+      data[idx] *= i / fadeOutSamples;
+    }
+  }
+}
+
+/** Renders a full genre-appropriate beat and returns a raw AudioBuffer. */
+export async function renderBeat(
+  genre: GenrePreset,
+  durationSecondsRaw: number,
+): Promise<AudioBuffer> {
+  const durationSeconds = clampDuration(durationSecondsRaw);
+
+  // Tone.Offline swaps a shared global audio context while its callback runs,
+  // so two overlapping Offline renders cross-connect nodes between contexts.
+  // These must run sequentially, not via Promise.all.
+  const accented = await renderUnit(genre, true);
+  const plain = await renderUnit(genre, false);
+  const units = LOOP_CYCLE.map((accent) => (accent ? accented : plain));
+  const tiled = tileToLength(units, durationSeconds);
+  applyFades(tiled);
+  return tiled;
 }
 
 export { MIN_DURATION, MAX_DURATION };
